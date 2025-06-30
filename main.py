@@ -1,14 +1,21 @@
 import asyncio
 import tweepy
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, InputMediaPhoto
 from aiogram.filters import Command
-from datetime import datetime, timedelta
 import aiosqlite
 from typing import Tuple, Optional
 
-from config import TWITTER_API_KEY, TWITTER_API_SECRET, TWITTER_ACCESS_TOKEN, TWITTER_ACCESS_TOKEN_SECRET, TWITTER_BEARER_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID, authors
-
+from config import (
+    TWITTER_API_KEY,
+    TWITTER_API_SECRET,
+    TWITTER_ACCESS_TOKEN,
+    TWITTER_ACCESS_TOKEN_SECRET,
+    TWITTER_BEARER_TOKEN,
+    TELEGRAM_BOT_TOKEN,
+    TELEGRAM_CHANNEL_ID,
+    authors
+)
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
@@ -22,7 +29,7 @@ twitter_client = tweepy.Client(
 )
 
 async def init_db():
-    async with aiosqlite.connect("anime_tweets.db") as db:
+    async with aiosqlite.connect("database.db") as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS last_checked (
                 author_username TEXT PRIMARY KEY,
@@ -40,6 +47,7 @@ async def init_db():
                 message_id INTEGER
             )
         """)
+        
         await db.execute("""
             CREATE TABLE IF NOT EXISTS user_votes (
                 user_id INTEGER,
@@ -51,7 +59,7 @@ async def init_db():
         await db.commit()
 
 async def get_last_tweet_id(author_username: str) -> Optional[str]:
-    async with aiosqlite.connect("anime_tweets.db") as db:
+    async with aiosqlite.connect("database.db") as db:
         cursor = await db.execute(
             "SELECT last_tweet_id FROM last_checked WHERE author_username = ?",
             (author_username,)
@@ -60,7 +68,7 @@ async def get_last_tweet_id(author_username: str) -> Optional[str]:
         return result[0] if result else None
 
 async def update_last_tweet(author_username: str, tweet_id: str):
-    async with aiosqlite.connect("anime_tweets.db") as db:
+    async with aiosqlite.connect("database.db") as db:
         await db.execute(
             """INSERT OR REPLACE INTO last_checked (author_username, last_tweet_id)
                VALUES (?, ?)""",
@@ -68,8 +76,17 @@ async def update_last_tweet(author_username: str, tweet_id: str):
         )
         await db.commit()
 
+async def get_tweet_stats(tweet_id: str) -> Tuple[int, int]:
+    async with aiosqlite.connect("database.db") as db:
+        cursor = await db.execute(
+            "SELECT likes, dislikes FROM tweets WHERE tweet_id = ?",
+            (tweet_id,)
+        )
+        result = await cursor.fetchone()
+        return result if result else (0, 0)
+
 async def update_tweet_stats(tweet_id: str, author: str, message_id: int):
-    async with aiosqlite.connect("tweets.db") as db:
+    async with aiosqlite.connect("database.db") as db:
         await db.execute(
             """INSERT OR IGNORE INTO tweets (tweet_id, author, likes, dislikes, message_id)
                VALUES (?, ?, 0, 0, ?)""",
@@ -80,7 +97,7 @@ async def update_tweet_stats(tweet_id: str, author: str, message_id: int):
 async def process_vote(callback: CallbackQuery, tweet_id: str, vote_type: str) -> Optional[Tuple[int, int]]:
     user_id = callback.from_user.id
     
-    async with aiosqlite.connect("tweets.db") as db:
+    async with aiosqlite.connect("database.db") as db:
         cursor = await db.execute(
             "SELECT vote_type FROM user_votes WHERE user_id = ? AND tweet_id = ?",
             (user_id, tweet_id)
@@ -177,12 +194,12 @@ async def check_new_tweets():
                 continue
                 
             if newest_tweet.id != last_tweet_id:
-                print(f"Найден новый твит от {author}: {newest_tweet.text[:50]}...")
                 
                 tweet_url = f"https://twitter.com/{author}/status/{newest_tweet.id}"
-                message_text = f"Author: @{author}:\n\n{tweet_url}"
+                message_text = f"<b>Author @{author}:\n\n{tweet_url}</b>"
                 
-                keyboard = create_vote_keyboard(newest_tweet.id)
+                likes, dislikes = await get_tweet_stats(newest_tweet.id)
+                keyboard = create_vote_keyboard(newest_tweet.id, likes, dislikes)
                 
                 if hasattr(newest_tweet, 'attachments'):
                     media_urls = await get_tweet_media(newest_tweet.id)
@@ -198,8 +215,8 @@ async def check_new_tweets():
                 
                 await update_last_tweet(author, newest_tweet.id)
                 
-        except Exception as e:
-            print(f"Ошибка при проверке {author}: {e}")
+        except Exception:
+            pass
 
 async def get_tweet_media(tweet_id: str) -> Optional[list]:
     try:
@@ -221,14 +238,11 @@ async def get_tweet_media(tweet_id: str) -> Optional[list]:
         
         return media_urls if media_urls else None
         
-    except Exception as e:
-        print(f"Ошибка при получении медиа: {e}")
+    except Exception:
         return None
 
 async def send_media_to_channel(media_urls: list, caption: str, keyboard: InlineKeyboardMarkup, tweet_id: str, author: str):
     try:
-        from aiogram.types import InputMediaPhoto
-        
         first_photo = media_urls[0]
         message = await bot.send_photo(
             TELEGRAM_CHANNEL_ID,
@@ -238,16 +252,16 @@ async def send_media_to_channel(media_urls: list, caption: str, keyboard: Inline
         )
         
         if len(media_urls) > 1:
-            media_group = []
-            for url in media_urls[1:10]:
-                media_group.append(InputMediaPhoto(media=url))
-            
+            media_group = [
+                InputMediaPhoto(media=url)
+                for url in media_urls[1:10]
+            ]
             await bot.send_media_group(TELEGRAM_CHANNEL_ID, media=media_group)
         
         await update_tweet_stats(tweet_id, author, message.message_id)
         
-    except Exception as e:
-        print(f"Ошибка при отправке медиа: {e}")
+    except Exception:
+        pass
 
 @dp.callback_query(F.data.startswith("like_") | F.data.startswith("dislike_"))
 async def handle_vote(callback: CallbackQuery):
@@ -261,27 +275,24 @@ async def handle_vote(callback: CallbackQuery):
             
             try:
                 await callback.message.edit_reply_markup(reply_markup=keyboard)
-            except:
+            except Exception:
                 pass
             
-            await callback.answer("Ваш голос учтен!")
+            await callback.answer("✅")
         else:
-            await callback.answer("Ошибка при обработке голоса")
-    except Exception as e:
-        print(f"Ошибка в handle_vote: {e}")
-        await callback.answer("Произошла ошибка")
+            pass
+            
+    except Exception:
+        pass
 
 async def scheduled_checker(minutes=10):
     while True:
-        try:
-            await check_new_tweets()
-        except Exception as e:
-            print(f"Ошибка в scheduled_checker: {e}")
+        await check_new_tweets()
         await asyncio.sleep(minutes * 60)
 
 @dp.message(Command("start"))
 async def start_cmd(message: Message):
-    await message.answer("Бот для парсинга твитов запущен!")
+    await message.answer("{TELEGRAM_CHANNEL_ID}")
 
 async def main():
     await init_db()
